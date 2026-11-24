@@ -25,6 +25,7 @@ export {
   createRpcFeeEstimator,
   stroopsToXlm,
   ReviewAddress,
+  RemovalReviewEntry,
   FeeEstimate,
   RpcFeeEstimatorOptions,
 } from './sync';

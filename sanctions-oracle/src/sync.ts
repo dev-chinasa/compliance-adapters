@@ -249,6 +249,16 @@ export interface SyncOptions {
    */
   reconcile?: boolean;
   /**
+   * Minimum age (in days) of a denylist entry before it may be delisted.
+   * Defaults to 0 (no delay) for backward compatibility; operators should set
+   * a positive value in production. Entries younger than this, or with unknown
+   * age, are placed in {@link SyncResult.removalReviewQueue} instead of being
+   * removed. Age is read from {@link SyncOptions.denylistAddedAt}.
+   */
+  minRemovalAgeDays?: number;
+  /** When each denylist entry was added, keyed by address. Values may be ISO dates or epoch milliseconds. */
+  denylistAddedAt?: Record<string, string | number>;
+  /**
    * Optional metrics registry.  Pass a `MetricsRegistry` instance to record
    * per-phase counters and latency histograms for `address_check` and
    * `denylist_write` operations.  When omitted all instrumentation is a no-op.
@@ -357,6 +367,15 @@ export interface ReviewAddress {
   score: number;
 }
 
+/** A cleared denylist entry held back from delisting pending operator review. */
+export interface RemovalReviewEntry {
+  address: string;
+  source: string;
+  reason: 'too-new' | 'unknown-age' | 'invalid-age';
+  /** Minimum required age in days at the time of the run. */
+  minRemovalAgeDays: number;
+}
+
 /** CLI exit code used when a run stops because `--max-duration` elapsed. */
 export const EXIT_CODE_DEADLINE_EXCEEDED = 3;
 
@@ -421,6 +440,8 @@ export interface SyncResult {
   plannedRemovals?: { address: string; source: string }[];
   /** Reconcile mode only: cleared addresses whose removal transaction failed. */
   failedRemovals?: FailedAddress[];
+  /** Reconcile mode only: cleared entries withheld from removal for manual review. */
+  removalReviewQueue?: RemovalReviewEntry[];
   /**
    * Flagged addresses whose score fell below {@link SyncOptions.minScoreToBlock}.
    * Reported for manual review and never written. Present only when
@@ -494,6 +515,8 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     checkpoint,
     resume = false,
     reconcile = false,
+    minRemovalAgeDays = 0,
+    denylistAddedAt,
     minScoreToBlock,
     feeEstimator,
   } = options;
@@ -573,6 +596,22 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
   const uniqueCount = validAddresses.length + invalid.length;
 
   const currentDenylistSet = new Set(currentDenylist.map(normalizeStellarAddress));
+  const addedAtMsByAddress = new Map<string, number>();
+  for (const [rawAddress, addedAt] of Object.entries(denylistAddedAt ?? {})) {
+    const ms = typeof addedAt === 'number' ? addedAt : Date.parse(addedAt);
+    if (Number.isFinite(ms)) {
+      addedAtMsByAddress.set(normalizeStellarAddress(rawAddress), ms);
+    }
+  }
+  /** Returns a review reason when an entry is too young to be delisted. */
+  const reviewRemoval = (address: string): RemovalReviewEntry['reason'] | undefined => {
+    if (minRemovalAgeDays <= 0) return undefined;
+    const addedAtMs = addedAtMsByAddress.get(address);
+    if (addedAtMs === undefined) return 'unknown-age';
+    if (addedAtMs > Date.now()) return 'invalid-age';
+    if (Date.now() - addedAtMs < minRemovalAgeDays * 24 * 60 * 60 * 1000) return 'too-new';
+    return undefined;
+  };
   if (reconcile) {
     // Denylist entries must be re-checked to learn whether they were cleared.
     for (const entry of currentDenylistSet) {
@@ -615,6 +654,7 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
   const flaggedWithSource: FlaggedAddressWithSource[] = [];
   const needsReview: ReviewAddress[] = [];
   const clearedWithSource: FlaggedAddressWithSource[] = [];
+  const removalReviewQueue: RemovalReviewEntry[] = [];
   const failed: string[] = [];
   const failedWithReasons: FailedAddress[] = [];
   let checked = 0;
@@ -683,8 +723,14 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
         } else if (reconcile && currentDenylistSet.has(address)) {
           // Cleared by the provider but still on the denylist: it is only
           // checkpointed once the removal succeeds, so an interrupted removal
-          // is retried on resume.
-          clearedWithSource.push({ address, source: result.source });
+          // is retried on resume. Young/unknown-age entries go to the review
+          // queue instead of being automatically delisted.
+          const reason = reviewRemoval(address);
+          if (reason) {
+            removalReviewQueue.push({ address, source: result.source, reason, minRemovalAgeDays });
+          } else {
+            clearedWithSource.push({ address, source: result.source });
+          }
         } else {
           // Clean address: nothing left to do for it, so it can be checkpointed
           // now. Flagged addresses are checkpointed only after a successful
@@ -857,6 +903,7 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
           removed,
           plannedRemovals: clearedWithSource.map(({ address, source }) => ({ address, source })),
           failedRemovals,
+          removalReviewQueue,
         }
       : {}),
     ...(minScoreToBlock !== undefined ? { needsReview } : {}),
@@ -1107,6 +1154,8 @@ export interface CliArgs {
   reconcile?: boolean;
   /** Path to a JSON array of the addresses currently on the denylist (the last snapshot). */
   denylistSnapshotPath?: string;
+  /** Minimum age in days before a cleared denylist entry may be removed. */
+  minRemovalAgeDays?: number;
   /** Print only the JSON SyncResult on stdout; route all logs to stderr. */
   json?: boolean;
   /** Path to an append-only JSONL file that records every denylist write. */
@@ -1199,6 +1248,15 @@ export function parseArgs(argv: string[]): CliArgs {
         args.denylistSnapshotPath = readValue(arg, i);
         i += 1;
         break;
+      case '--min-removal-age-days': {
+        const days = Number(readValue(arg, i));
+        if (!Number.isFinite(days) || days < 0) {
+          throw new Error('--min-removal-age-days must be a non-negative number');
+        }
+        args.minRemovalAgeDays = days;
+        i += 1;
+        break;
+      }
       case '--json':
         args.json = true;
         break;
@@ -1249,8 +1307,11 @@ OPTIONS:
   --max-duration <ms>         Hard deadline for the run. When it elapses no new checks start,
                                in-flight checks finish, results are saved and the process
                                exits with code 3 (EXIT_CODE_DEADLINE_EXCEEDED)
-  --denylist-snapshot <path>  Path to JSON file containing an array of the addresses currently
-                               on the denylist
+  --denylist-snapshot <path>  Path to JSON file with the current denylist: an array of address
+                               strings, or objects { address, addedAt } where addedAt is an ISO
+                               date / epoch ms used by --min-removal-age-days
+  --min-removal-age-days <n>   Do not delist entries younger than n days; younger or unknown-age
+                               entries are reported in removalReviewQueue for manual review
   --dry-run                   Preview output without writing to the contract
   --plan                      Print a diff of planned adds/removes with their source
                                lists and write nothing (implies --dry-run). With
@@ -1335,13 +1396,37 @@ export async function runCli(argv?: string[]): Promise<void> {
   }
 
   let currentDenylist: string[] | undefined;
+  let denylistAddedAt: Record<string, string | number> | undefined;
   if (args.denylistSnapshotPath) {
     try {
-      const parsed = JSON.parse(fs.readFileSync(args.denylistSnapshotPath, 'utf8'));
-      if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) {
-        throw new Error('Denylist snapshot must be a JSON array of strings');
+      const parsed = JSON.parse(fs.readFileSync(args.denylistSnapshotPath, 'utf8')) as unknown;
+      if (!Array.isArray(parsed)) {
+        throw new Error('Denylist snapshot must be a JSON array');
       }
-      currentDenylist = parsed;
+      currentDenylist = [];
+      for (const item of parsed) {
+        if (typeof item === 'string') {
+          currentDenylist.push(item);
+          continue;
+        }
+        if (
+          typeof item === 'object' &&
+          item !== null &&
+          typeof (item as { address?: unknown }).address === 'string' &&
+          ((item as { addedAt?: unknown }).addedAt === undefined ||
+            typeof (item as { addedAt?: unknown }).addedAt === 'string' ||
+            typeof (item as { addedAt?: unknown }).addedAt === 'number')
+        ) {
+          const entry = item as { address: string; addedAt?: string | number };
+          currentDenylist.push(entry.address);
+          if (entry.addedAt !== undefined) {
+            denylistAddedAt ??= {};
+            denylistAddedAt[normalizeStellarAddress(entry.address)] = entry.addedAt;
+          }
+          continue;
+        }
+        throw new Error('Denylist snapshot entries must be strings or { address, addedAt } objects');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       logger.error(
@@ -1399,6 +1484,8 @@ export async function runCli(argv?: string[]): Promise<void> {
       logger,
       maxDurationMs: args.maxDurationMs,
       currentDenylist,
+      denylistAddedAt,
+      minRemovalAgeDays: args.minRemovalAgeDays,
       // A plan with a snapshot should show removals even without an explicit
       // --reconcile: the snapshot already identifies the current denylist.
       reconcile: args.reconcile || (args.plan === true && currentDenylist !== undefined),
@@ -1475,6 +1562,8 @@ export async function runCli(argv?: string[]): Promise<void> {
     logger,
     maxDurationMs: args.maxDurationMs,
     currentDenylist,
+    denylistAddedAt,
+    minRemovalAgeDays: args.minRemovalAgeDays,
     reconcile: args.reconcile,
     checkpoint,
     resume: Boolean(checkpoint),
