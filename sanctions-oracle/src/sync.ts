@@ -201,6 +201,14 @@ export interface SyncOptions {
   addresses: string[];
   writer: DenylistWriter;
   dryRun?: boolean;
+  /**
+   * Produce a diff report of the planned denylist changes before writing.
+   * Implies `dryRun`: no transactions are submitted. The report is available
+   * programmatically as {@link SyncResult.plan} and printed by the CLI.
+   */
+  plan?: boolean;
+  /** Hard deadline for the run in milliseconds; no new checks start once elapsed. */
+  maxDurationMs?: number;
   /** Retry-with-backoff config applied around each provider.checkAddress call. */
   retry?: RetryOptions;
   /**
@@ -421,6 +429,13 @@ export interface SyncResult {
   needsReview?: ReviewAddress[];
   /** Dry-run only: estimated fee for the pending writes (see {@link SyncOptions.feeEstimator}). */
   feeEstimate?: FeeEstimate;
+  /** True when --max-duration stopped new checks before all addresses were processed. */
+  deadlineExceeded?: boolean;
+  /** Structured diff produced in {@link SyncOptions.plan} mode; nothing is written. */
+  plan?: {
+    adds: { address: string; source: string }[];
+    removes: { address: string; source: string }[];
+  };
 }
 
 interface FlaggedAddressWithSource {
@@ -466,7 +481,9 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     addresses,
     writer,
     dryRun = false,
+    plan = false,
     logger = noopLogger,
+    maxDurationMs,
     retry,
     cache,
     progressInterval = 100,
@@ -480,6 +497,9 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     minScoreToBlock,
     feeEstimator,
   } = options;
+  // Plan mode is strictly read-only: it computes the same diff a live sync
+  // would apply, but never submits writes.
+  const effectiveDryRun = dryRun || plan;
   const deadline = maxDurationMs !== undefined ? Date.now() + maxDurationMs : undefined;
   const pastDeadline = () => deadline !== undefined && Date.now() >= deadline;
   const started = new Set<string>();
@@ -511,9 +531,18 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     safeLogger.debug(message);
   };
 
-  safeLogger.info('sanctions-oracle: starting sync', { total: addresses.length, dryRun });
+  safeLogger.info('sanctions-oracle: starting sync', {
+    total: addresses.length,
+    dryRun: effectiveDryRun,
+    plan,
+  });
 
-  if (reconcile && !dryRun && !writer.removeFromDenylist && !writer.removeFromDenylistWithSource) {
+  if (
+    reconcile &&
+    !effectiveDryRun &&
+    !writer.removeFromDenylist &&
+    !writer.removeFromDenylistWithSource
+  ) {
     throw new Error(
       'sanctions-oracle: reconcile requires a writer that implements removeFromDenylist',
     );
@@ -697,14 +726,16 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
 
   const written: string[] = [];
   let feeEstimate: FeeEstimate | undefined;
-  if (dryRun) {
+  const plannedAdds: { address: string; source: string }[] = [];
+  if (effectiveDryRun) {
     const pendingWrites: string[] = [];
-    for (const { address } of flaggedWithSource) {
+    for (const { address, source } of flaggedWithSource) {
       if (currentDenylistSet.has(address)) {
         continue;
       }
       pendingWrites.push(address);
-      safeLogger.info('sanctions-oracle: [dry-run] would call add_to_denylist', { address });
+      plannedAdds.push({ address, source });
+      safeLogger.info('sanctions-oracle: [dry-run] would call add_to_denylist', { address, source });
     }
     if (feeEstimator) {
       feeEstimate = await estimateDryRunFee(pendingWrites, feeEstimator);
@@ -767,7 +798,7 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
   const failedRemovals: FailedAddress[] = [];
   if (reconcile) {
     for (const { address, source } of clearedWithSource) {
-      if (dryRun) {
+      if (effectiveDryRun) {
         safeLogger.info('sanctions-oracle: [dry-run] would call remove_from_denylist', {
           address,
           source,
@@ -811,7 +842,16 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     failedWithReasons,
     invalid,
     skipped,
-    dryRun,
+    deadlineExceeded,
+    dryRun: effectiveDryRun,
+    ...(plan
+      ? {
+          plan: {
+            adds: plannedAdds,
+            removes: clearedWithSource.map(({ address, source }) => ({ address, source })),
+          },
+        }
+      : {}),
     ...(reconcile
       ? {
           removed,
@@ -1050,6 +1090,8 @@ export function createRpcDenylistWriter(options: RpcDenylistWriterOptions): Deny
 export interface CliArgs {
   addressesPath?: string;
   dryRun: boolean;
+  /** Preview the add/remove diff without writing; implies dry-run. */
+  plan?: boolean;
   contractId?: string;
   rpcUrl?: string;
   networkPassphrase?: string;
@@ -1071,6 +1113,8 @@ export interface CliArgs {
   auditLogPath?: string;
   /** Path to a checkpoint file; addresses completed by a prior run are skipped. */
   checkpointPath?: string;
+  /** Hard deadline in milliseconds; no new checks start once elapsed. */
+  maxDurationMs?: number;
 }
 
 /** Logger that writes every level to stderr, keeping stdout clean for `--json`. */
@@ -1108,6 +1152,9 @@ export function parseArgs(argv: string[]): CliArgs {
         break;
       case '--dry-run':
         args.dryRun = true;
+        break;
+      case '--plan':
+        args.plan = true;
         break;
       case '--contract-id':
         args.contractId = readValue(arg, i);
@@ -1205,7 +1252,12 @@ OPTIONS:
   --denylist-snapshot <path>  Path to JSON file containing an array of the addresses currently
                                on the denylist
   --dry-run                   Preview output without writing to the contract
-  --json                      Print only the JSON SyncResult on stdout; logs go to stderr
+  --plan                      Print a diff of planned adds/removes with their source
+                               lists and write nothing (implies --dry-run). With
+                               --denylist-snapshot, removals are included in the diff
+  --json                      Print only the JSON result on stdout (includes a machine-
+                               readable \`plan.adds\` / \`plan.removes\` diff in --plan mode);
+                               logs go to stderr
   --audit-log <path>          Append one JSON line per denylist write to <path>
   --checkpoint <path>         Persist completed addresses to <path> and skip them on re-run
   --help, -h                  Show this help message
@@ -1321,7 +1373,7 @@ export async function runCli(argv?: string[]): Promise<void> {
     provider = new RateLimitedSanctionsProvider(provider);
   }
 
-  if (args.dryRun) {
+  if (args.dryRun || args.plan) {
     // Fee estimation needs RPC details and the submitting account; it is
     // skipped (no feeEstimate in the report) when they are not provided.
     const dryRunSecret = process.env.SANCTIONS_ORACLE_SECRET_KEY ?? args.secretKey;
@@ -1343,11 +1395,27 @@ export async function runCli(argv?: string[]): Promise<void> {
         },
       },
       dryRun: true,
+      plan: args.plan,
       logger,
+      maxDurationMs: args.maxDurationMs,
       currentDenylist,
-      reconcile: args.reconcile,
+      // A plan with a snapshot should show removals even without an explicit
+      // --reconcile: the snapshot already identifies the current denylist.
+      reconcile: args.reconcile || (args.plan === true && currentDenylist !== undefined),
       ...(dryRunFeeEstimator ? { feeEstimator: dryRunFeeEstimator } : {}),
     });
+    if (args.plan && result.plan) {
+      const { adds, removes } = result.plan;
+      logger.info(
+        `sanctions-oracle: plan: ${adds.length} add(s), ${removes.length} remove(s)`,
+      );
+      for (const { address, source } of adds) {
+        logger.info(`PLAN ADD ${address} ${source}`);
+      }
+      for (const { address, source } of removes) {
+        logger.info(`PLAN REMOVE ${address} ${source}`);
+      }
+    }
     if (result.feeEstimate?.error) {
       logger.error?.(`sanctions-oracle: ${result.feeEstimate.error}`);
     } else if (result.feeEstimate) {
@@ -1405,6 +1473,7 @@ export async function runCli(argv?: string[]): Promise<void> {
     writer,
     dryRun: false,
     logger,
+    maxDurationMs: args.maxDurationMs,
     currentDenylist,
     reconcile: args.reconcile,
     checkpoint,
