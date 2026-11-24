@@ -24,6 +24,8 @@ export {
   toSafeLogString,
   createRpcFeeEstimator,
   stroopsToXlm,
+  EXIT_CODE_DEADLINE_EXCEEDED,
+  EXIT_CODE_APPROVAL_REQUIRED,
   ReviewAddress,
   RemovalReviewEntry,
   FeeEstimate,

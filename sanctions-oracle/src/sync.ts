@@ -209,6 +209,12 @@ export interface SyncOptions {
   plan?: boolean;
   /** Hard deadline for the run in milliseconds; no new checks start once elapsed. */
   maxDurationMs?: number;
+  /**
+   * Maximum number of denylist writes (adds + removals) allowed without manual
+   * approval. When a live run would exceed this, no writes are submitted and
+   * the result has `approvalRequired: true` (CLI exits with code 4).
+   */
+  maxAutoWrites?: number;
   /** Retry-with-backoff config applied around each provider.checkAddress call. */
   retry?: RetryOptions;
   /**
@@ -378,6 +384,8 @@ export interface RemovalReviewEntry {
 
 /** CLI exit code used when a run stops because `--max-duration` elapsed. */
 export const EXIT_CODE_DEADLINE_EXCEEDED = 3;
+/** CLI exit code used when a run is paused for manual approval of a large sync. */
+export const EXIT_CODE_APPROVAL_REQUIRED = 4;
 
 /**
  * A single address whose provider check failed on every retry attempt,
@@ -452,6 +460,12 @@ export interface SyncResult {
   feeEstimate?: FeeEstimate;
   /** True when --max-duration stopped new checks before all addresses were processed. */
   deadlineExceeded?: boolean;
+  /** True when the proposed writes exceeded {@link SyncOptions.maxAutoWrites}; nothing was written. */
+  approvalRequired?: boolean;
+  /** Number of writes the run proposed before it was paused. */
+  approvalRequiredCount?: number;
+  /** Threshold that triggered manual approval. */
+  approvalThreshold?: number;
   /** Structured diff produced in {@link SyncOptions.plan} mode; nothing is written. */
   plan?: {
     adds: { address: string; source: string }[];
@@ -505,6 +519,7 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     plan = false,
     logger = noopLogger,
     maxDurationMs,
+    maxAutoWrites,
     retry,
     cache,
     progressInterval = 100,
@@ -770,15 +785,46 @@ export async function syncSanctionsToDenylist(options: SyncOptions): Promise<Syn
     flagged: flagged.length,
   });
 
+  const pendingAdds = flaggedWithSource.filter(({ address }) => !currentDenylistSet.has(address));
+  const proposedWrites = pendingAdds.length + (reconcile ? clearedWithSource.length : 0);
+  // A buggy provider returning thousands of addresses must not result in
+  // thousands of automatic on-chain writes. Pause before submitting anything.
+  if (!effectiveDryRun && maxAutoWrites !== undefined && proposedWrites > maxAutoWrites) {
+    safeLogger.warn('sanctions-oracle: approval required before writing denylist changes', {
+      proposedWrites,
+      maxAutoWrites,
+    });
+    return {
+      checked: started.size,
+      flagged,
+      written: [],
+      failed,
+      failedWithReasons,
+      invalid,
+      skipped,
+      deadlineExceeded,
+      dryRun: false,
+      approvalRequired: true,
+      approvalRequiredCount: proposedWrites,
+      approvalThreshold: maxAutoWrites,
+      ...(reconcile
+        ? {
+            removed: [],
+            plannedRemovals: clearedWithSource.map(({ address, source }) => ({ address, source })),
+            failedRemovals: [],
+            removalReviewQueue,
+          }
+        : {}),
+      ...(minScoreToBlock !== undefined ? { needsReview } : {}),
+    };
+  }
+
   const written: string[] = [];
   let feeEstimate: FeeEstimate | undefined;
   const plannedAdds: { address: string; source: string }[] = [];
   if (effectiveDryRun) {
     const pendingWrites: string[] = [];
-    for (const { address, source } of flaggedWithSource) {
-      if (currentDenylistSet.has(address)) {
-        continue;
-      }
+    for (const { address, source } of pendingAdds) {
       pendingWrites.push(address);
       plannedAdds.push({ address, source });
       safeLogger.info('sanctions-oracle: [dry-run] would call add_to_denylist', { address, source });
@@ -1156,6 +1202,8 @@ export interface CliArgs {
   denylistSnapshotPath?: string;
   /** Minimum age in days before a cleared denylist entry may be removed. */
   minRemovalAgeDays?: number;
+  /** Pause for approval when a live run proposes more than this many writes. */
+  approvalThreshold?: number;
   /** Print only the JSON SyncResult on stdout; route all logs to stderr. */
   json?: boolean;
   /** Path to an append-only JSONL file that records every denylist write. */
@@ -1257,6 +1305,15 @@ export function parseArgs(argv: string[]): CliArgs {
         i += 1;
         break;
       }
+      case '--approval-threshold': {
+        const threshold = Number(readValue(arg, i));
+        if (!Number.isInteger(threshold) || threshold < 1) {
+          throw new Error('--approval-threshold must be a positive integer');
+        }
+        args.approvalThreshold = threshold;
+        i += 1;
+        break;
+      }
       case '--json':
         args.json = true;
         break;
@@ -1312,6 +1369,8 @@ OPTIONS:
                                date / epoch ms used by --min-removal-age-days
   --min-removal-age-days <n>   Do not delist entries younger than n days; younger or unknown-age
                                entries are reported in removalReviewQueue for manual review
+  --approval-threshold <n>     Pause a live sync needing more than n writes; no writes are
+                               submitted and the process exits with code 4
   --dry-run                   Preview output without writing to the contract
   --plan                      Print a diff of planned adds/removes with their source
                                lists and write nothing (implies --dry-run). With
@@ -1561,6 +1620,7 @@ export async function runCli(argv?: string[]): Promise<void> {
     dryRun: false,
     logger,
     maxDurationMs: args.maxDurationMs,
+    maxAutoWrites: args.approvalThreshold,
     currentDenylist,
     denylistAddedAt,
     minRemovalAgeDays: args.minRemovalAgeDays,
@@ -1571,7 +1631,14 @@ export async function runCli(argv?: string[]): Promise<void> {
   // CLI-only: machine-readable result to stdout (see dry-run branch above).
   // eslint-disable-next-line no-console
   console.log(JSON.stringify(result, null, 2));
-  if (result.deadlineExceeded) process.exitCode = EXIT_CODE_DEADLINE_EXCEEDED;
+  if (result.approvalRequired) {
+    logger.error(
+      `sanctions-oracle: ${result.approvalRequiredCount} writes require manual approval (threshold ${result.approvalThreshold}); nothing was written`,
+    );
+    process.exitCode = EXIT_CODE_APPROVAL_REQUIRED;
+  } else if (result.deadlineExceeded) {
+    process.exitCode = EXIT_CODE_DEADLINE_EXCEEDED;
+  }
 }
 
 if (require.main === module) {
